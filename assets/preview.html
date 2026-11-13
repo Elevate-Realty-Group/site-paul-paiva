@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live preview</title>
+<style>
+html,body{margin:0;height:100%;background:#fff;overflow:hidden}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#fff}
+iframe.back{visibility:hidden}
+#msg{position:absolute;inset:0;z-index:2;display:grid;place-items:center;text-align:center;padding:24px;font:500 15px/1.5 system-ui,sans-serif;color:#59628f;background:#fff}
+#msg[hidden]{display:none}
+</style>
+</head>
+<body>
+<div id="msg">Loading the live preview…</div>
+<iframe id="a" title="Preview"></iframe><iframe id="b" class="back" title="Preview" aria-hidden="true"></iframe>
+<script>
+/* The Hub's live preview (Customize; Paul, November 6: "it should be instant"). The Hub frames this page and sends the
+   website's row as it's being edited (saved or not); the website's own builder (agent-sites/engine, the Python that
+   Publish runs, here in the browser by Pyodide, loaded from the Hub) makes the home page from this site's listings
+   (data/listings.json) and what the last build found (data/preview.json), and it's shown below. So the preview is the
+   page a Publish makes (homepage.preview(), build(home_only=True)). Only the Hub may drive it; messages carry data only. */
+(function () {
+  var local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  var HUBS = ['https://elevaterealtyhub.ca', 'https://www.elevaterealtyhub.ca'];
+  var q = new URLSearchParams(location.search);
+  var SRC = local && q.get('src') ? q.get('src') : 'https://elevaterealtyhub.ca/agent-sites/';
+  var ROOT = location.pathname.replace(/assets\/preview\.html$/, '');
+  var FILES = ['engine/build.py', 'engine/homepage.py', 'engine/places.py', 'engine/seo.py', 'areas.json', 'data/places.json',
+    'templates/classic/layout.html', 'templates/classic/pages.json', 'templates/classic/pages/home.html'];
+  var msg = document.getElementById('msg'), front = document.getElementById('a'), back = document.getElementById('b');
+  var hub = null, py = null, want = null, busy = false, seen = null;
+  // the part of the page each Customize panel changes (focus: the panel's key), gone to when the panel opens (Paul,
+  // November 12: on Menu, show the menu); the home page's sections carry data-sec (homepage.sections)
+  var TOPS = { branding: 1, look: 1, menu: 1, details: 1, hero: 1, layout: 1 };
+  function goTo(win, focus) {
+    try {
+      var d = win.document, el = TOPS[focus] ? null : focus === 'footer' ? d.querySelector('footer') : d.querySelector('[data-sec="' + focus + '"]');
+      if (TOPS[focus]) win.scrollTo({ top: 0, behavior: 'smooth' });
+      else if (el) win.scrollTo({ top: Math.max(0, el.getBoundingClientRect().top + win.scrollY - 90), behavior: 'smooth' });
+    } catch (e) {}
+  }
+
+  function tell(m) { if (hub) hub.source.postMessage(m, hub.origin); }
+  function oops(t) { msg.hidden = false; msg.textContent = t; tell({ type: 'pv-error', error: t }); }
+
+  var ready = (async function () {
+    var s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
+    await new Promise(function (ok, no) { s.onload = ok; s.onerror = function () { no(new Error('Pyodide did not load')); }; document.head.appendChild(s); });
+    var v = '?v=' + Date.now().toString(36);
+    var texts = await Promise.all(FILES.map(function (f) {
+      return fetch(SRC + f + v).then(function (r) { if (!r.ok) throw new Error(f + ' ' + r.status); return r.text(); });
+    }).concat([
+      fetch(ROOT + 'data/listings.json').then(function (r) { if (!r.ok) throw new Error('listings ' + r.status); return r.text(); }),
+      fetch(ROOT + 'data/preview.json').then(function (r) { return r.ok ? r.text() : '{}'; }).catch(function () { return '{}'; })
+    ]));
+    py = await loadPyodide();
+    FILES.forEach(function (f, i) {
+      var parts = ('/ag/' + f).split('/');
+      for (var j = 2; j < parts.length; j++) { var d = parts.slice(0, j).join('/'); try { py.FS.mkdir(d); } catch (e) {} }
+      py.FS.writeFile('/ag/' + f, texts[i]);
+    });
+    py.globals.set('ROWS_JSON', texts[FILES.length]);
+    py.globals.set('KIT_JSON', texts[FILES.length + 1]);
+    py.globals.set('ROOT', ROOT);
+    py.runPython('import sys, json\nsys.path.insert(0, "/ag/engine")\nimport homepage as HP\nROWS = json.loads(ROWS_JSON)\nKIT = json.loads(KIT_JSON)\ndel ROWS_JSON');
+  })();
+
+  async function render() {
+    if (busy || !want) return;
+    busy = true;
+    var job = want; want = null;
+    try {
+      await ready;
+      var t = Date.now();
+      py.globals.set('SITE_JSON', JSON.stringify(job.site));
+      py.globals.set('PUBLIC', job.public || '');
+      // the Hub's automatic headshot as Customize has it now (photo, "" for none); unknown, the last build's
+      py.runPython('PHOTO = KIT.get("photo") or ""');
+      if (typeof job.photo === 'string') py.globals.set('PHOTO', job.photo);
+      var html = py.runPython('from urllib.parse import quote\n' +
+        'HP.preview(json.loads(SITE_JSON), ROWS, ROOT, lambda p: PUBLIC + "/".join(quote(x) for x in p.split("/")), ' +
+        'PHOTO, KIT.get("bands") or {}, KIT.get("sides") or [])');
+      html = html.replace('</head>', '<style>.previewbar,.termsbar{display:none!important}</style></head>');
+      html = html.replace(/ loading="lazy"/g, '');   // every photo in before it shows, so the page is its full height (show)
+      await show(html);
+      msg.hidden = true;
+      if (job.focus && job.focus !== seen) { seen = job.focus; goTo(front.contentWindow, job.focus); }
+      tell({ type: 'pv-done', ms: Date.now() - t });
+    } catch (e) {
+      oops('The preview couldn’t be made: ' + String(e && e.message || e).split('\n').filter(Boolean).slice(-1)[0]);
+    }
+    busy = false;
+    if (want) render();
+  }
+  // into the hidden frame, at the same scroll, then swapped in: no flash. The new page is held at least as tall as the
+  // one showing until its photos load (they load lazily, so it starts shorter), or near the bottom (the footer) it would
+  // land higher every redraw (Paul, November 12: it scrolled while he typed his phone numbers)
+  function show(html) {
+    return new Promise(function (ok) {
+      var y = 0, h = 0;
+      try { y = front.contentWindow.scrollY || 0; h = front.contentDocument.documentElement.scrollHeight || 0; } catch (e) {}
+      back.onload = function () {
+        try {
+          var de = back.contentDocument.documentElement;
+          if (h) { de.style.minHeight = h + 'px'; setTimeout(function () { de.style.minHeight = ''; }, 1500); }
+          back.contentWindow.scrollTo(0, y);
+        } catch (e) {}
+        setTimeout(function () {
+          back.classList.remove('back'); back.removeAttribute('aria-hidden');
+          front.classList.add('back'); front.setAttribute('aria-hidden', 'true');
+          var t = front; front = back; back = t; ok();
+        }, 60);
+      };
+      back.srcdoc = html;
+    });
+  }
+
+  window.addEventListener('message', function (e) {
+    if (HUBS.indexOf(e.origin) < 0 && !(local && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(e.origin))) return;
+    var d = e.data || {};
+    if (d.type !== 'pv-site' || !d.site) return;
+    hub = { source: e.source, origin: e.origin };
+    want = d; render();
+  });
+  ready.then(function () { tell({ type: 'pv-ready' }); }, function (e) { oops('The preview couldn’t start: ' + (e && e.message || e)); });
+  if (window.parent !== window) window.parent.postMessage({ type: 'pv-hello' }, '*');
+})();
+</script>
+</body>
+</html>
